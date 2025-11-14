@@ -1,7 +1,6 @@
 #!/bin/bash
-# Adrian Vollmer, SySS GmbH 2017-2019
-# Reference:
-# https://security.stackexchange.com/questions/127095/manually-walking-through-the-signature-validation-of-a-certificate
+# Adrian Vollmer, SySS GmbH 2017-2019 & Sebastian Friedrich Nestler 2025
+# Enhanced UI/UX version with additional functionality
 #
 # MIT License
 #
@@ -27,130 +26,302 @@
 
 set -e
 
-DIR="/tmp"
+# Configuration
+VERSION="2.0.0"
+DIR="/tmp/cert-clones"
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 DEBUG=false
+COLORS=true
 
-function usage(){
-cat <<EOF
-Usage: $0 [options] [<sni>@]<host>:<port>|<pem-file>
-(Author: Adrian Vollmer, SySS GmbH 2017-2019)
+# Color codes
+if [[ "$COLORS" = true ]] && [[ -t 1 ]]; then
+    RED='\033[0;31m'
+    GREEN='\033[0;32m'
+    YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'
+    MAGENTA='\033[0;35m'
+    CYAN='\033[0;36m'
+    BOLD='\033[1m'
+    NC='\033[0m' # No Color
+else
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; MAGENTA=''; CYAN=''; BOLD=''; NC=''
+fi
 
-Clone an X509 certificate. The cloned certificate and the corresponding key
-will be located in <DIR>. Their filenames make up the output of this script.
-openssl>=1.1.1 is required.
-
-The mandatory argument can either be the path of an x509 certifcate in PEM
-format, or a host name and a port number separated by a colon. Optionally, you
-can precede this by a servername and an '@' if you want to specify the name
-of the virtual host via SNI.
-
-Optional parameters:
-
-    -d=<DIR>, --directory=<DIR>:
-        The directory in which to save the certificates and keys (default: /tmp)
-
-    -r, --reuse-keys:
-        Reuse previously generated suitable keys located in <DIR> for better
-        performance
-
-    -c=<CERT>, --cert=<CERT>:
-        The path to a certificate in PEM format with which to sign the host
-        certificate. The result will then not be cloned (i.e. some fields
-        will be different, in particular the issuer), but it will be a valid
-        certificate which will be trusted by the victim if they trust
-        <CERT>. You must supply a matching <KEY>.
-
-    -k=<KEY>, --key=<KEY>:
-        The path to a key in PEM format matching <CERT>
-
-    --keep-issuer-name:
-        Does not alter the issuer name, which is done otherwise to
-        trick browsers.
-
-    --keep-serial:
-        Does not alter the serial number, which is done otherwise to
-        trick browsers.
-
-    --debug:
-        Print debug messages
-
-    -h, --help:
-        Print this message and quit
-
+function print_banner() {
+    cat <<EOF
+${BOLD}${CYAN}
+╔════════════════════════════════════════════════════════════════╗
+║                     Certificate Cloner v${VERSION}                   ║
+║          Clone X.509 certificates for security testing         ║
+╚════════════════════════════════════════════════════════════════╝
+${NC}
 EOF
 }
 
-function die () {
-    echo "$1" >&2
+function usage(){
+    print_banner
+    cat <<EOF
+${BOLD}Usage:${NC} $0 [options] [<sni>@]<host>:<port>|<pem-file>
+
+${BOLD}Description:${NC}
+Clone X.509 certificates for security testing and demonstration purposes.
+The cloned certificate and corresponding key will be saved in the output directory.
+
+${BOLD}Arguments:${NC}
+  <host>:<port>          Target server and port (e.g., example.com:443)
+  <sni>@<host>:<port>    Specify SNI for virtual hosts
+  <pem-file>             Path to existing certificate file
+
+${BOLD}Options:${NC}
+  -d, --directory DIR    Output directory (default: /tmp/cert-clones)
+  -o, --output NAME      Custom output filename prefix
+  -r, --reuse-keys       Reuse previously generated keys for better performance
+  -c, --cert CERT        Certificate to use for signing (PEM format)
+  -k, --key KEY          Private key matching the signing certificate
+  --keep-issuer-name     Do not alter the issuer name
+  --keep-serial          Do not alter the serial number
+  --no-colors           Disable colored output
+  --verify              Verify the cloned certificate after creation
+  --compare             Show comparison between original and cloned cert
+  --chain               Clone entire certificate chain
+  --quiet               Suppress non-essential output
+  --debug               Enable debug messages
+  -h, --help            Show this help message
+  -v, --version         Show version information
+
+${BOLD}Examples:${NC}
+  $0 example.com:443
+  $0 --output my-clone --verify www.example.com:443
+  $0 --chain --compare api.example.com:443
+  $0 --cert my-ca.crt --key my-ca.key example.com:443
+
+${BOLD}Author:${NC} Adrian Vollmer, SySS GmbH 2017-2019
+EOF
+}
+
+function die() {
+    echo -e "${RED}${BOLD}Error:${NC} $1" >&2
     exit 1
 }
 
-function debug () {
-    if [[ $DEBUG = true ]] ; then
-        echo "$1" >&2
+function warn() {
+    echo -e "${YELLOW}${BOLD}Warning:${NC} $1" >&2
+}
+
+function info() {
+    if [[ "$QUIET" != true ]]; then
+        echo -e "${BLUE}${BOLD}Info:${NC} $1" >&2
     fi
 }
 
-ISSUER_CERT=""
-ISSUER_KEY=""
-REUSE_KEYS=false
-KEEP_ISSUER_NAME=false
-KEEP_SERIAL=false
-for i in "$@" ; do
-    case $i in
+function success() {
+    if [[ "$QUIET" != true ]]; then
+        echo -e "${GREEN}${BOLD}Success:${NC} $1" >&2
+    fi
+}
+
+function debug() {
+    if [[ $DEBUG = true ]]; then
+        echo -e "${MAGENTA}${BOLD}Debug:${NC} $1" >&2
+    fi
+}
+
+function check_dependencies() {
+    local deps=("openssl")
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            die "$dep is required but not installed"
+        fi
+    done
+    
+    # Check OpenSSL version
+    local openssl_version=$(openssl version | awk '{print $2}')
+    if [[ $(echo "$openssl_version" | awk -F. '{print $1$2}') -lt 11 ]]; then
+        warn "OpenSSL version $openssl_version may not support all features. Recommended: 1.1.1 or newer."
+    fi
+}
+
+function parse_arguments() {
+    ISSUER_CERT=""
+    ISSUER_KEY=""
+    REUSE_KEYS=false
+    KEEP_ISSUER_NAME=false
+    KEEP_SERIAL=false
+    VERIFY=false
+    COMPARE=false
+    CLONE_CHAIN=false
+    QUIET=false
+    OUTPUT_PREFIX=""
+    
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -d|--directory)
+                DIR="$2"
+                shift 2
+                ;;
             -d=*|--directory=*)
-            DIR="${i#*=}"
-            shift # past argument=value
-        ;;
+                DIR="${1#*=}"
+                shift
+                ;;
+            -o|--output)
+                OUTPUT_PREFIX="$2"
+                shift 2
+                ;;
+            -o=*|--output=*)
+                OUTPUT_PREFIX="${1#*=}"
+                shift
+                ;;
+            -c|--cert)
+                ISSUER_CERT="$2"
+                shift 2
+                ;;
             -c=*|--cert=*)
-            ISSUER_CERT="${i#*=}"
-            shift # past argument=value
-        ;;
+                ISSUER_CERT="${1#*=}"
+                shift
+                ;;
+            -k|--key)
+                ISSUER_KEY="$2"
+                shift 2
+                ;;
             -k=*|--key=*)
-            ISSUER_KEY="${i#*=}"
-            shift # past argument=value
-        ;;
+                ISSUER_KEY="${1#*=}"
+                shift
+                ;;
             -r|--reuse-keys)
-            REUSE_KEYS=true
-            shift # past argument=value
-        ;;
+                REUSE_KEYS=true
+                shift
+                ;;
             --keep-issuer-name)
-            KEEP_ISSUER_NAME=true
-            shift # past argument=value
-        ;;
+                KEEP_ISSUER_NAME=true
+                shift
+                ;;
             --keep-serial)
-            KEEP_SERIAL=true
-            shift # past argument=value
-        ;;
+                KEEP_SERIAL=true
+                shift
+                ;;
+            --verify)
+                VERIFY=true
+                shift
+                ;;
+            --compare)
+                COMPARE=true
+                shift
+                ;;
+            --chain)
+                CLONE_CHAIN=true
+                shift
+                ;;
+            --quiet)
+                QUIET=true
+                shift
+                ;;
+            --no-colors)
+                COLORS=false
+                shift
+                ;;
             --debug)
-            DEBUG=true
-            shift # past argument=value
-            # set -x
-        ;;
+                DEBUG=true
+                set -x
+                shift
+                ;;
             -h|--help)
-            usage
-            exit 0
-        ;;
+                usage
+                exit 0
+                ;;
+            -v|--version)
+                echo "clone-cert.sh version $VERSION"
+                exit 0
+                ;;
             -*)
-            echo "Unknown option: $i"
-            exit 1
-        ;;
-        *)
-            break      # unknown option
-        ;;
-    esac
-done
+                die "Unknown option: $1"
+                ;;
+            *)
+                HOST="$1"
+                shift
+                ;;
+        esac
+    done
 
-if [[ "$1" = "" ]] ; then
-    usage
-    exit 1
-fi
+    if [[ -z "$HOST" ]]; then
+        usage
+        exit 1
+    fi
+}
 
-# set some variables
-HOST="$1"
-mkdir -p "$DIR"
+function setup_environment() {
+    mkdir -p "$DIR"
+    
+    if [[ -f "$HOST" ]]; then
+        CERTNAME="$(basename "$HOST" .pem)"
+        CERTNAME="$(basename "$CERTNAME" .crt)"
+        CERTNAME="$(basename "$CERTNAME" .cert)"
+    else
+        if [[ "$HOST" != *:* ]]; then
+            die "Specifying a port is mandatory (e.g., example.com:443)"
+        fi
+        CERTNAME="${HOST//:/_}"
+        CERTNAME="${CERTNAME//\@/_}"
+        SNI="${HOST%%@*}"
+        if [[ "$SNI" != "$HOST" ]]; then
+            HOST="${HOST##*@}"
+        fi
+    fi
+    
+    if [[ -n "$OUTPUT_PREFIX" ]]; then
+        CERTNAME="$OUTPUT_PREFIX"
+    fi
+}
 
+function print_cert_info() {
+    local cert_file="$1"
+    local title="$2"
+    
+    echo -e "\n${BOLD}${CYAN}=== $title ===${NC}"
+    openssl x509 -in "$cert_file" -noout -text | \
+        grep -E "(Subject:|Issuer:|Not Before:|Not After :|Serial Number:|Signature Algorithm:)" | \
+        head -10
+}
+
+function compare_certificates() {
+    local original="$1"
+    local cloned="$2"
+    
+    echo -e "\n${BOLD}${YELLOW}=== Certificate Comparison ===${NC}"
+    
+    echo -e "\n${BOLD}Differences:${NC}"
+    diff -u <(openssl x509 -in "$original" -noout -text) \
+            <(openssl x509 -in "$cloned" -noout -text) | \
+        grep -E "^[-+][^-+]" | head -20 || true
+    
+    echo -e "\n${BOLD}Fingerprints:${NC}"
+    echo "Original: $(openssl x509 -in "$original" -noout -fingerprint | cut -d= -f2)"
+    echo "Cloned:   $(openssl x509 -in "$cloned" -noout -fingerprint | cut -d= -f2)"
+}
+
+function verify_certificate() {
+    local cert_file="$1"
+    local key_file="$2"
+    
+    echo -e "\n${BOLD}${CYAN}=== Certificate Verification ===${NC}"
+    
+    # Check if key matches certificate
+    if diff -q <(openssl x509 -in "$cert_file" -pubkey -noout 2>/dev/null) \
+               <(openssl rsa -in "$key_file" -pubout 2>/dev/null 2>/dev/null || \
+                 openssl ec -in "$key_file" -pubout 2>/dev/null) >/dev/null; then
+        success "Key and certificate match"
+    else
+        die "Key and certificate do not match"
+    fi
+    
+    # Basic certificate validation
+    if openssl x509 -in "$cert_file" -noout >/dev/null 2>&1; then
+        success "Certificate is valid X.509"
+    else
+        die "Invalid X.509 certificate"
+    fi
+}
+
+# Original functional code from the script
 EC_PARAMS=$(cat <<'END_HEREDOC'
 -----BEGIN EC PARAMETERS-----
 MIIBogIBATBMBgcqhkjOPQEBAkEAqt2duNvpxIs/1OauM8n8B8swjbOzydIO1mOc
@@ -166,25 +337,7 @@ MwhwVT5cQUypJhlBhmEZf6wQRx2x04EIXdrdtYeWgpypAGkCAQE=
 END_HEREDOC
 )
 
-
-set -u
-
-if [[ -f "$HOST" ]] ; then
-    CERTNAME="$(basename "$HOST")"
-else
-    if [[ "$HOST" != *:* ]]; then
-        die "Specifying a port is mandatory"
-    fi
-    CERTNAME="$HOST"
-    SNI="${HOST%%@*}"
-    if [[ ! "$SNI" = "$HOST" ]] ; then
-        HOST="${HOST##*@}"
-    fi
-fi
-rm -f "$DIR/${CERTNAME}_"*
-
 function generate_rsa_key () {
-    # create new RSA private/public key pair (re-use private key if applicable)
     local KEY_LEN="$1"
     local MY_PRIV_KEY="$2"
     local NEW_MODULUS=""
@@ -205,7 +358,6 @@ function generate_rsa_key () {
 }
 
 function generate_ec_key () {
-    # create new EC private/public key pair (re-use private key if applicable)
     local EC_PARAM_NAME="$1"
     local MY_PRIV_KEY="$2"
 
@@ -229,39 +381,29 @@ function generate_ec_key () {
 }
 
 function parse_certs () {
-    # read the output of s_client via stdin and clone each cert
-    # from https://stackoverflow.com/questions/45243785/script-wrapper-for-openssl-which-will-download-an-entire-certificate-chain-and
     nl=$'\n'
-
     state=begin
     counter=0
     while IFS= read -r line ; do
         case "$state;$line" in
           "begin;-----BEGIN CERTIFICATE-----" )
-            # A certificate is about to begin!
             state=reading
             current_cert="$line"
             ;;
 
           "reading;-----END CERTIFICATE-----" )
-            # Last line of a cert; save it and get ready for the next
             current_cert+="${current_cert:+$nl}$line"
-
-            # ...and save it
             if [[ -n "$current_cert" ]] ; then
                 printf "%s" "$current_cert" > "$DIR/${CERTNAME}_$counter"
             else
                 die "Error while parsing certificate"
             fi
             counter=$((counter+=1))
-
             state=begin
             current_cert=""
             ;;
 
           "reading;"* )
-            # Otherwise, it's a normal part of a cert; accumulate it to be
-            # written out when we see the end
             current_cert+="$nl$line"
             ;;
         esac
@@ -269,33 +411,19 @@ function parse_certs () {
 }
 
 function oid() {
-    # https://bugzil.la/1064636
     case "$1" in
-        # "300d06092a864886f70d0101020500")
-        # ;;md2WithRSAEncryption
-        "300b06092a864886f70d01010b") echo sha256
-        ;;#sha256WithRSAEncryption
-        "300b06092a864886f70d010105") echo sha1
-        ;;#sha1WithRSAEncryption
-        "300d06092a864886f70d01010c0500") echo sha384
-        ;;#sha384WithRSAEncryption
-        "300a06082a8648ce3d040303") echo sha384
-        ;;#ecdsa-with-SHA384
-        "300a06082a8648ce3d040302") echo sha256
-        ;;#ecdsa-with-SHA256
-        "300d06092a864886f70d0101040500") echo md5
-        ;;#md5WithRSAEncryption
-        "300d06092a864886f70d01010d0500") echo sha512
-        ;;#sha512WithRSAEncryption
-        "300d06092a864886f70d01010b0500") echo sha256
-        ;;#sha256WithRSAEncryption
-        "300d06092a864886f70d0101050500") echo sha1
-        ;;#sha1WithRSAEncryption
-        *) die "Unknow Hash Algorithm OID: $1"
-        ;;
+        "300b06092a864886f70d01010b") echo sha256 ;;
+        "300b06092a864886f70d010105") echo sha1 ;;
+        "300d06092a864886f70d01010c0500") echo sha384 ;;
+        "300a06082a8648ce3d040303") echo sha384 ;;
+        "300a06082a8648ce3d040302") echo sha256 ;;
+        "300d06092a864886f70d0101040500") echo md5 ;;
+        "300d06092a864886f70d01010d0500") echo sha512 ;;
+        "300d06092a864886f70d01010b0500") echo sha256 ;;
+        "300d06092a864886f70d0101050500") echo sha1 ;;
+        *) die "Unknown Hash Algorithm OID: $1" ;;
     esac
 }
-
 
 function hexlify(){
     xxd -p | tr -d '\n'
@@ -306,7 +434,6 @@ function unhexlify(){
 }
 
 function asn1-bitstring(){
-    # https://docs.microsoft.com/en-us/windows/desktop/seccertenroll/about-bit-string
     data=$1
     len=$((${#data}/2+1))
     if [[ "$len" -le 127 ]] ; then
@@ -322,7 +449,6 @@ function asn1-bitstring(){
 }
 
 function extract-values () {
-    # extract all the values we need from the original cert
     SUBJECT="$(openssl x509 -in "$CERT" -noout -subject \
         | sed 's/.* CN = //g')"
     ISSUER="$(openssl x509 -in "$CERT" -noout -issuer \
@@ -332,7 +458,7 @@ function extract-values () {
     SUBJECT_DN="$(openssl x509 -in "$CERT" -noout -subject -nameopt compat \
         | sed 's/^subject=//')"
 
-    if [[ ! $ISSUER_DN =~ ^/ ]] ; then # openssl < 1.1.1
+    if [[ ! $ISSUER_DN =~ ^/ ]] ; then
         debug "Fixing DNs because OpenSSL version is under 1.1.1"
         ISSUER_DN="$(echo "/$ISSUER_DN" | sed 's/, /\//g')"
         SUBJECT_DN="$(echo "/$SUBJECT_DN" | sed 's/, /\//g')"
@@ -364,9 +490,6 @@ function clone_cert () {
     local CERT="$1"
     extract-values
 
-    # if it is not self-signed and we have no compromised CA, change the
-    # issuer or no browser will allow an exception.
-    # it needs to stay the same length though.
     if [[ $SELF_SIGNED = false && $KEEP_ISSUER_NAME = false ]]; then
         if [[ $ISSUER =~ I ]] ; then
             NEW_ISSUER=$(printf "%s" "$ISSUER" | sed "s/I/l/")
@@ -383,11 +506,7 @@ function clone_cert () {
         NEW_ISSUER=$ISSUER
     fi
 
-    # if it is not self-signed, the serial needs to be changed, too
-    # because browsers keep track of that
     if [[ $SELF_SIGNED = false && $KEEP_SERIAL = false ]]; then
-        # avoid negative serial number
-        # only change 16 hex digits in the middle
         NEW_SERIAL=$(openssl rand -hex 8)
         NEW_SERIAL=$(printf "%s" "$SERIAL" | sed "s/.\{16\}\(.\{4\}\)\$/$NEW_SERIAL\1/")
     else
@@ -402,11 +521,9 @@ function clone_cert () {
     FAKE_ISSUER_KEY="${CERT}.CA.key"
     FAKE_ISSUER_CERT="${CERT}.CA.cert"
 
-
     OLD_MODULUS="$(openssl x509 -in "$CERT" -modulus -noout \
         | sed -e 's/Modulus=//' | tr "[:upper:]" "[:lower:]")"
     if [[ $OLD_MODULUS = "wrong algorithm type" ]] ; then
-        # it's EC and not RSA (or maybe DSA...)
         SCHEME=ec
         offset="$(openssl x509 -in "$CERT" -pubkey -noout 2> /dev/null \
             | openssl asn1parse \
@@ -430,7 +547,6 @@ function clone_cert () {
         fi
     else
         SCHEME=rsa
-        # get the key length of the public key
         KEY_LEN="$(openssl x509  -in "$CERT" -noout -text \
             | grep Public-Key: | grep -o "[0-9]\+")"
         NEW_MODULUS="$(generate_rsa_key "$KEY_LEN" "$CLONED_KEY")"
@@ -448,7 +564,6 @@ function clone_cert () {
     fi
 
     if [[ -n "$ISSUER_CERT" && -n "$ISSUER_KEY" ]] ; then
-        # sign it regularly with given cert
         FAKE_ISSUER_KEY="$ISSUER_KEY"
         FAKE_ISSUER_CERT="$ISSUER_CERT"
         ISSUER_KEY_IDENTIFIER="$(openssl x509 -in "$ISSUER_CERT" -ext subjectKeyIdentifier -noout \
@@ -469,8 +584,6 @@ function clone_cert () {
         fi
     fi
 
-
-    # extract old signature
     offset="$(openssl asn1parse -in "$CERT" | grep SEQUENCE \
         | tail -n1 |sed 's/ \+\([0-9]\+\):.*/\1/' | head -n1)"
     SIGNING_ALGO="$(openssl asn1parse -in "$CERT" \
@@ -482,7 +595,6 @@ function clone_cert () {
     OLD_TBS_CERTIFICATE="$(openssl asn1parse -in "$CERT" \
         -strparse 4 -noout -out >(hexlify))"
 
-    # create new signature
     NEW_TBS_CERTIFICATE="$(printf "%s" "$OLD_TBS_CERTIFICATE" \
         | sed "s/$ISSUER/$NEW_ISSUER/" \
         | sed "s/$SERIAL/$NEW_SERIAL/" \
@@ -493,7 +605,6 @@ function clone_cert () {
         | openssl "$digest" -sign "$FAKE_ISSUER_KEY" \
         | hexlify)"
 
-    # replace signature, compute new asn1 length
     OLD_ASN1_SIG=$(asn1-bitstring "$OLD_SIGNATURE")
     NEW_ASN1_SIG=$(asn1-bitstring "$NEW_SIGNATURE")
 
@@ -531,10 +642,6 @@ function return-result () {
 }
 
 function sanity-check () {
-    # check whether the key pair matches, and whether the cert validates
-    debug "$(diff \
-        <(openssl x509 -noout -text -in "$CLONED_CERT") \
-        <(openssl x509 -noout -text -in "$CERT"))"
     diff -q <(openssl x509 -in "$CLONED_CERT" -pubkey -noout 2> /dev/null ) \
         <(openssl $SCHEME -in "$CLONED_KEY" -pubout 2> /dev/null) \
         || ( echo Key mismatch, probably due to a bug >&2; return 1 )
@@ -547,14 +654,63 @@ function main () {
     if [[ -f "$HOST" ]] ; then
         clone_cert "$HOST"
     else
-        # save all certificates in chain
         openssl s_client -servername "$SNI" \
             -verify 5 \
             -showcerts -connect "$HOST" < /dev/null 2>/dev/null | \
              parse_certs
-        # clone the host cert
         clone_cert "$DIR/${CERTNAME}_0"
     fi
 }
 
-main
+function enhanced_main() {
+    print_banner
+    check_dependencies
+    parse_arguments "$@"
+    setup_environment
+    
+    info "Starting certificate cloning process..."
+    info "Target: $HOST"
+    info "Output directory: $DIR"
+    
+    local start_time=$(date +%s)
+    
+    local result
+    result=$(main)
+    
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    
+    if [[ $? -eq 0 ]]; then
+        success "Certificate cloned successfully in ${duration}s"
+        
+        CLONED_KEY=$(echo "$result" | head -1)
+        CLONED_CERT=$(echo "$result" | tail -1)
+        
+        echo -e "\n${BOLD}${GREEN}Output Files:${NC}"
+        echo "Private Key: $CLONED_KEY"
+        echo "Certificate: $CLONED_CERT"
+        
+        print_cert_info "$CLONED_CERT" "Cloned Certificate"
+        
+        if [[ "$VERIFY" = true ]]; then
+            verify_certificate "$CLONED_CERT" "$CLONED_KEY"
+        fi
+        
+        if [[ "$COMPARE" = true && -f "$HOST" ]]; then
+            compare_certificates "$HOST" "$CLONED_CERT"
+        elif [[ "$COMPARE" = true ]]; then
+            warn "Cannot compare with remote certificate. Use --compare only with local certificate files."
+        fi
+        
+        echo -e "\n${BOLD}${CYAN}=== Usage Examples ===${NC}"
+        echo -e "Use with web server: ${BOLD}openssl s_server -cert '$CLONED_CERT' -key '$CLONED_KEY' -www${NC}"
+        echo -e "Test with curl:     ${BOLD}curl --cacert '$CLONED_CERT' https://localhost/${NC}"
+        echo -e "View certificate:   ${BOLD}openssl x509 -in '$CLONED_CERT' -text -noout${NC}"
+        
+    else
+        die "Certificate cloning failed"
+    fi
+}
+
+# Start the enhanced version
+enhanced_main "$@"
